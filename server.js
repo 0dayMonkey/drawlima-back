@@ -1,27 +1,53 @@
-// server.js (v1.4)
-// Now with persistent drawing history for the infinite canvas.
+// server.js (v1.5)
+// Avec persistance de la map sur fichier et fonctionnalité "Tout Effacer".
 
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
+const fs = require('fs'); // NOUVEAU: Module pour gérer les fichiers
 
 const PORT = 8080;
+const MAP_FILE = './map.json'; // NOUVEAU: Fichier de sauvegarde de la map
+
 const wss = new WebSocket.Server({ port: PORT });
-
-// We use a Map to store client data (ws object -> user info).
 const clients = new Map();
-
-// A list of distinct, pleasant colors to assign to new users.
 const userColors = [
     '#E57373', '#81C784', '#64B5F6', '#FFD54F', '#BA68C8',
     '#4DB6AC', '#F06292', '#7986CB', '#A1887F', '#90A4AE'
 ];
 
-// NEW: Store all drawing actions in memory.
-const drawingHistory = [];
+// NOUVEAU: Charger l'historique depuis le fichier au démarrage
+let drawingHistory = [];
+try {
+    if (fs.existsSync(MAP_FILE)) {
+        const fileData = fs.readFileSync(MAP_FILE, 'utf-8');
+        drawingHistory = JSON.parse(fileData);
+        console.log(`[Server] Map chargée depuis ${MAP_FILE}. ${drawingHistory.length} actions trouvées.`);
+    }
+} catch (error) {
+    console.error('[Server] Erreur au chargement de la map:', error);
+}
 
-function broadcast(message, senderId) {
+// NOUVEAU: Fonction pour sauvegarder la map
+function saveMap() {
+    fs.writeFile(MAP_FILE, JSON.stringify(drawingHistory, null, 2), (err) => {
+        if (err) {
+            console.error('[Server] Erreur lors de la sauvegarde de la map:', err);
+        } else {
+            console.log('[Server] Map sauvegardée avec succès.');
+        }
+    });
+}
+
+function broadcast(message) {
     clients.forEach((clientInfo, ws) => {
-        // We check if the client's connection is open and if they are not the original sender.
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(message));
+        }
+    });
+}
+
+function broadcastToOthers(message, senderId) {
+    clients.forEach((clientInfo, ws) => {
         if (ws.readyState === WebSocket.OPEN && clientInfo.id !== senderId) {
             ws.send(JSON.stringify(message));
         }
@@ -29,78 +55,58 @@ function broadcast(message, senderId) {
 }
 
 wss.on('connection', (ws) => {
-    // 1. Assign unique ID and a color to the new client upon initial connection.
     const id = uuidv4();
     const color = userColors[clients.size % userColors.length];
     const metadata = { id, color, username: 'Anonymous' };
     
     clients.set(ws, metadata);
-    console.log(`[Server] New client connected. Assigned ID: ${id}. Total clients: ${clients.size}`);
+    console.log(`[Server] New client connected. Assigned ID: ${id}.`);
 
-    // 2. Handle incoming messages with a simple routing logic based on message type.
     ws.on('message', (rawMessage) => {
         const message = JSON.parse(rawMessage);
         const senderInfo = clients.get(ws);
 
         switch (message.type) {
-            // Case A: Client sends their username upon joining.
             case 'login':
                 senderInfo.username = message.username;
-                console.log(`[Server] Client ${senderInfo.id} set username to: ${senderInfo.username}`);
-
-                // Send a "welcome" package to the new user with their info,
-                // a list of everyone else, and the entire drawing history.
                 ws.send(JSON.stringify({
                     type: 'welcome',
                     user: senderInfo,
                     allUsers: Array.from(clients.values()),
-                    drawingHistory: drawingHistory // <-- SEND THE COMPLETE HISTORY
+                    drawingHistory: drawingHistory
                 }));
-
-                // Announce the new user to all other clients.
-                broadcast({
-                    type: 'user-joined',
-                    user: senderInfo,
-                }, senderInfo.id);
+                broadcastToOthers({ type: 'user-joined', user: senderInfo }, senderInfo.id);
                 break;
             
-            // Case B: Client sends drawing data.
             case 'draw':
-                // Add the new drawing action to history for future users.
                 drawingHistory.push(message);
-                // Broadcast the drawing data to other currently connected clients.
-                broadcast(message, senderInfo.id);
+                broadcastToOthers(message, senderInfo.id);
+                saveMap(); // Sauvegarder après chaque nouveau dessin
                 break;
             
-            // Case C: Client sends their cursor position.
             case 'cursor-move':
-                // Broadcast cursor position, attaching the sender's ID.
-                broadcast({
-                    type: 'cursor-move',
-                    id: senderInfo.id,
-                    payload: message.payload
-                }, senderInfo.id);
+                broadcastToOthers({ type: 'cursor-move', id: senderInfo.id, payload: message.payload }, senderInfo.id);
+                break;
+
+            // NOUVEAU: Gérer l'effacement complet
+            case 'clear':
+                drawingHistory.length = 0; // Vider l'historique
+                broadcast({ type: 'clear' }); // Informer tous les clients
+                saveMap(); // Sauvegarder la map vide
+                console.log(`[Server] Map effacée par ${senderInfo.username}.`);
                 break;
         }
     });
 
-    // 3. Handle client disconnection.
     ws.on('close', () => {
         const closedClientInfo = clients.get(ws);
         if (closedClientInfo) {
-            console.log(`[Server] Client ${closedClientInfo.id} (${closedClientInfo.username}) disconnected.`);
-            // Announce that the user has left to all remaining clients so they can be removed.
-            broadcast({
-                type: 'user-left',
-                id: closedClientInfo.id
-            }, null); // Send to everyone, including a potential sender if needed.
+            broadcastToOthers({ type: 'user-left', id: closedClientInfo.id }, null);
         }
-        clients.delete(ws); // Remove the client from our active list.
+        clients.delete(ws);
     });
 
-    ws.on('error', (error) => {
-        console.error('[Server] WebSocket error:', error);
-    });
+    ws.on('error', (error) => console.error('[Server] WebSocket error:', error));
 });
 
-console.log(`[Server] WebSocket server v1.4 (Infinite Canvas) started on port ${PORT}`);
+console.log(`[Server] WebSocket server v1.5 (Persistance activée) démarré sur le port ${PORT}`);
