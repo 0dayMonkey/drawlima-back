@@ -1,0 +1,14 @@
+{
+  "name": "drawlima-back",
+  "version": "1.0.0",
+  "description": "Backend WebSocket server for the DrawLima collaborative whiteboard.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "author": "teamcrouton",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.17.0"
+  }
+}
