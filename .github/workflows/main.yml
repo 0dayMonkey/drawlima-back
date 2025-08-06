@@ -1,0 +1,37 @@
+# Nom du workflow qui apparaîtra dans l'onglet "Actions" de GitHub
+name: Déploiement sur VPS
+
+# Déclencheur du workflow
+on:
+  push:
+    branches:
+      - main  # Se déclenche uniquement sur les push vers la branche main
+
+# Tâches à exécuter
+jobs:
+  deploy:
+    # Utilise la dernière version d'Ubuntu disponible sur GitHub Actions
+    runs-on: ubuntu-latest
+
+    steps:
+      # Étape 1: Récupère le code source de votre dépôt
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      # Étape 2: Se connecte au VPS et exécute le script de déploiement
+      - name: Déploiement sur le VPS
+        uses: appleboy/ssh-action@master
+        with:
+          # Informations de connexion
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          password: ${{ secrets.VPS_PASSWORD }} # <-- On utilise le mot de passe
+          port: ${{ secrets.VPS_PORT || 22 }}
+
+          # Le script reste identique
+          script: |
+            cd /var/www/drawlima-back
+            git fetch origin main
+            git reset --hard origin/main
+            npm install --omit=dev
+            pm2 reload drawnlima-back
