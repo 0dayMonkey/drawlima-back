@@ -34,4 +34,3 @@ jobs:
             git fetch origin main
             git reset --hard origin/main
             npm install --omit=dev
-            pm2 reload drawnlima-back
