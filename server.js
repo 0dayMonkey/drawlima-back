@@ -7,7 +7,6 @@ const { v4: uuidv4 } = require('uuid');
 const PORT = 8080;
 
 // -- In-Memory State Management --
-// Map to store user data across connections { userId -> { username, ws, currentRoomId } }
 const users = new Map(); 
 const whiteboards = new Map();
 
@@ -15,15 +14,12 @@ const wss = new WebSocketServer({ port: PORT });
 console.log(`[Server] WebSocket server V2 started on port ${PORT}`);
 
 wss.on('connection', (ws) => {
-    // A WebSocket connection is established, but the user is not yet authenticated.
-    // We will assign a temporary ws.id for handling until authentication.
     ws.id = uuidv4(); 
     console.log(`[Server] Incoming connection with temporary ID: ${ws.id}`);
 
     ws.on('message', (rawMessage) => {
         try {
             const message = JSON.parse(rawMessage);
-            // Pass the WebSocket instance itself to the handler
             handleMessage(ws, message);
         } catch (error) {
             console.error(`[Server] Failed to parse message or handle logic:`, error);
@@ -31,7 +27,6 @@ wss.on('connection', (ws) => {
     });
 
     ws.on('close', () => {
-        // Find user associated with this specific WebSocket instance
         let userIdToDisconnect = null;
         for (const [userId, userData] of users.entries()) {
             if (userData.ws === ws) {
@@ -53,7 +48,6 @@ function handleMessage(ws, message) {
     const { type, payload } = message;
     const user = getUserByWs(ws);
 
-    // All drawing and room logic requires an authenticated user
     if (!user && type !== 'auth') {
         console.warn(`[Server] Received message of type '${type}' from unauthenticated client. Ignoring.`);
         return;
@@ -61,11 +55,11 @@ function handleMessage(ws, message) {
 
     switch (type) {
         case 'auth':
-            let userId = payload.token || uuidv4(); // Use token if provided, else create new user
+            let userId = payload.token || uuidv4();
             let isReconnecting = users.has(userId);
 
             const oldWs = isReconnecting ? users.get(userId).ws : null;
-            if (oldWs && oldWs !== ws) {
+            if (oldWs && oldWs !== ws && oldWs.readyState === 1) {
                 console.log(`[Server] Terminating old connection for user ${payload.username}.`);
                 oldWs.terminate();
             }
@@ -102,9 +96,7 @@ function handleMessage(ws, message) {
         case 'end_stroke':
         case 'delete_stroke':
             if (user.currentRoomId) {
-                // First, broadcast the message to everyone else in the room
                 broadcastToRoom(user.currentRoomId, message, user.userId);
-                // Then, update the server's state for persistence
                 handleDrawingState(user, type, payload);
             }
             break;
@@ -121,7 +113,12 @@ function handleMessage(ws, message) {
 }
 
 function handleRoomLogic(user, type, payload) {
-    if (user.currentRoomId) {
+    // CORRECTED: Get the ACTUAL user object from the map to modify it directly.
+    const actualUser = users.get(user.userId);
+    if (!actualUser) return; // Safety check
+
+    // Leave any previous room
+    if (actualUser.currentRoomId) {
         leaveCurrentRoom(user.userId);
     }
     
@@ -131,7 +128,7 @@ function handleRoomLogic(user, type, payload) {
         const roomId = uuidv4();
         const newWhiteboard = {
             id: roomId, name: payload.name, size: payload.size,
-            creator: user.username, createdAt: new Date().toISOString(),
+            creator: actualUser.username, createdAt: new Date().toISOString(),
             clients: new Set(),
             strokes: [],
             activeStrokes: new Map()
@@ -140,17 +137,19 @@ function handleRoomLogic(user, type, payload) {
         console.log(`[Server] Room created: ${payload.name} (${roomId})`);
         broadcast({ type: 'room_list_update', payload: { whiteboards: getWhiteboardList() } });
         roomToJoinId = roomId; // Automatically join the room you create
-    } else {
+    } else { // This handles 'join_room'
         roomToJoinId = payload.roomId;
     }
     
     const roomToJoin = whiteboards.get(roomToJoinId);
     if (roomToJoin) {
         roomToJoin.clients.add(user.userId);
-        user.currentRoomId = roomToJoinId;
-        console.log(`[Server] User ${user.username} joined room ${roomToJoin.name} (${roomToJoinId})`);
+        // CORRECTED: Update the 'currentRoomId' on the actual user object
+        actualUser.currentRoomId = roomToJoinId;
+        console.log(`[Server] User ${actualUser.username} joined room ${roomToJoin.name} (${roomToJoinId})`);
 
-        user.ws.send(JSON.stringify({
+        // Send confirmation and room data to the user who just joined
+        actualUser.ws.send(JSON.stringify({
             type: 'joined_room',
             payload: {
                 roomId: roomToJoin.id, name: roomToJoin.name, size: roomToJoin.size,
@@ -160,9 +159,10 @@ function handleRoomLogic(user, type, payload) {
             }
         }));
 
+        // Notify everyone else in the room that a new user has joined
         broadcastToRoom(roomToJoinId, {
             type: 'user_joined',
-            payload: { user: { id: user.userId, username: user.username } }
+            payload: { user: { id: user.userId, username: actualUser.username } }
         }, user.userId);
     }
 }
@@ -174,8 +174,6 @@ function handleDrawingState(user, type, payload) {
 
     switch (type) {
         case 'start_stroke':
-            // CORRECTED: The payload *is* the stroke object.
-            // We just ensure the userId is the one from the authenticated user.
             const newStroke = { ...payload, userId: user.userId };
             room.activeStrokes.set(newStroke.id, newStroke);
             break;
@@ -196,8 +194,6 @@ function handleDrawingState(user, type, payload) {
             break;
             
         case 'delete_stroke':
-            // The client-side logic should prevent sending deletes for others' strokes,
-            // but we can add a server-side check for security.
             const originalStrokeIndex = room.strokes.findIndex(s => s.id === payload.strokeId);
             if (originalStrokeIndex !== -1 && room.strokes[originalStrokeIndex].userId === user.userId) {
                  room.strokes.splice(originalStrokeIndex, 1);
@@ -234,7 +230,6 @@ function leaveCurrentRoom(userId) {
         }
         broadcastToRoom(roomId, { type: 'user_left', payload: { userId: userId } });
         
-        // If the room is empty, consider deleting it after a timeout
         if (room.clients.size === 0) {
             console.log(`[Server] Room ${room.name} is now empty. It will be deleted in 60 seconds if no one rejoins.`);
             setTimeout(() => {
@@ -247,6 +242,7 @@ function leaveCurrentRoom(userId) {
             }, 60000); // 60-second grace period
         }
     }
+    // This modification happens on the actual user object fetched from the map
     user.currentRoomId = null;
 }
 
@@ -277,6 +273,7 @@ function broadcastToRoom(roomId, message, excludeUserId = null) {
 function getUserByWs(ws) {
     if (!ws.userId) return null;
     const user = users.get(ws.userId);
+    // Return a copy, including the userId for convenience
     return user ? { ...user, userId: ws.userId } : null;
 }
 
