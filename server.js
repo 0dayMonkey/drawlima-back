@@ -1,109 +1,245 @@
-// server.js (v1.6)
-// Gestion par "objets-traits" avec suppression sécurisée par propriétaire.
+// server.js - Real-time Whiteboard Backend
+// ==========================================
 
-const WebSocket = require('ws');
+const { WebSocketServer } = require('ws');
 const { v4: uuidv4 } = require('uuid');
-const fs = require('fs');
 
-const PORT = 8080;
-const MAP_FILE = './map.json'; // Fichier de sauvegarde de la map
+// -- Configuration --
+const PORT = 8080; // The port your WebSocket server will run on.
 
-const wss = new WebSocket.Server({ port: PORT });
-const clients = new Map();
-const userColors = ['#E57373', '#81C784', '#64B5F6', '#FFD54F', '#BA68C8', '#4DB6AC', '#F06292', '#7986CB', '#A1887F', '#90A4AE'];
+// -- In-Memory State Management --
+// We don't use a database. All data is stored in these objects.
+// If the server restarts, all drawings will be lost.
+const clients = new Map(); // Stores connected clients: { ws.id -> { ws, username, currentRoomId } }
+const whiteboards = new Map(); // Stores whiteboard rooms: { roomId -> { ...roomData } }
 
-// Charger l'historique depuis le fichier au démarrage
-let drawingHistory = [];
-try {
-    if (fs.existsSync(MAP_FILE)) {
-        const fileData = fs.readFileSync(MAP_FILE, 'utf-8');
-        drawingHistory = JSON.parse(fileData);
-        console.log(`[Server] Map chargée depuis ${MAP_FILE}. ${drawingHistory.length} traits trouvés.`);
-    }
-} catch (error) {
-    console.error('[Server] Erreur au chargement de la map:', error);
-}
-
-// Fonction pour sauvegarder la map de manière asynchrone
-function saveMap() {
-    fs.writeFile(MAP_FILE, JSON.stringify(drawingHistory, null, 2), (err) => {
-        if (err) console.error('[Server] Erreur lors de la sauvegarde de la map:', err);
-    });
-}
-
-// Envoyer un message à tous les clients connectés
-function broadcast(message) {
-    const data = JSON.stringify(message);
-    clients.forEach((clientInfo, ws) => {
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(data);
-        }
-    });
-}
+// -- Server Initialization --
+const wss = new WebSocketServer({ port: PORT });
+console.log(`[Server] WebSocket server started on port ${PORT}`);
 
 wss.on('connection', (ws) => {
-    const id = uuidv4();
-    const color = userColors[clients.size % userColors.length];
-    const metadata = { id, color, username: 'Anonymous' };
-    
-    clients.set(ws, metadata);
-    console.log(`[Server] Client connecté: ${id}. Total: ${clients.size}`);
+    // 1. Assign a unique ID to the new client upon connection.
+    ws.id = uuidv4();
+    console.log(`[Server] Client connected with ID: ${ws.id}`);
 
+    // 2. Handle incoming messages from the client.
     ws.on('message', (rawMessage) => {
-        const message = JSON.parse(rawMessage);
-        const senderInfo = clients.get(ws);
-
-        switch (message.type) {
-            case 'login':
-                senderInfo.username = message.username;
-                ws.send(JSON.stringify({
-                    type: 'welcome',
-                    user: senderInfo,
-                    allUsers: Array.from(clients.values()),
-                    drawingHistory: drawingHistory
-                }));
-                broadcast({ type: 'user-joined', user: senderInfo });
-                break;
-            
-            case 'add-stroke':
-                const newStroke = message.stroke;
-                newStroke.ownerId = senderInfo.id; // Sécurité: le serveur assigne le propriétaire
-                drawingHistory.push(newStroke);
-                broadcast({ type: 'add-stroke', stroke: newStroke });
-                saveMap();
-                break;
-
-            case 'delete-stroke':
-                const strokeIdToDelete = message.strokeId;
-                const strokeIndex = drawingHistory.findIndex(s => s.strokeId === strokeIdToDelete);
-
-                if (strokeIndex !== -1) {
-                    if (drawingHistory[strokeIndex].ownerId === senderInfo.id) {
-                        drawingHistory.splice(strokeIndex, 1);
-                        broadcast({ type: 'delete-stroke', strokeId: strokeIdToDelete });
-                        saveMap();
-                        console.log(`[Server] Trait ${strokeIdToDelete} effacé par ${senderInfo.username}.`);
-                    } else {
-                        console.log(`[Server] ALERTE SECURITE: ${senderInfo.username} a tenté d'effacer un trait qui ne lui appartient pas.`);
-                    }
-                }
-                break;
-            
-            case 'cursor-move':
-                message.id = senderInfo.id;
-                broadcast(message);
-                break;
+        try {
+            const message = JSON.parse(rawMessage);
+            handleMessage(ws, message);
+        } catch (error) {
+            console.error(`[Server] Failed to parse message or handle logic:`, error);
         }
     });
 
+    // 3. Handle client disconnection.
     ws.on('close', () => {
-        const closedClientInfo = clients.get(ws);
-        if (closedClientInfo) {
-            broadcast({ type: 'user-left', id: closedClientInfo.id });
-            console.log(`[Server] Client déconnecté: ${closedClientInfo.id}. Total: ${clients.size - 1}`);
-        }
-        clients.delete(ws);
+        handleDisconnect(ws);
+    });
+
+    ws.on('error', (error) => {
+        console.error(`[Server] WebSocket error for client ${ws.id}:`, error);
     });
 });
 
-console.log(`[Server] WebSocket server v1.6 (Gestion par Objet) démarré sur le port ${PORT}`);
+// -- Core Message Handler --
+function handleMessage(ws, message) {
+    const { type, payload } = message;
+    // console.log(`[Server] Received message of type "${type}" from ${ws.id}`);
+
+    switch (type) {
+        case 'auth':
+            // Client sends their desired username.
+            clients.set(ws.id, { ws, username: payload.username, currentRoomId: null });
+            ws.send(JSON.stringify({
+                type: 'authenticated',
+                payload: {
+                    userId: ws.id,
+                    whiteboards: getWhiteboardList()
+                }
+            }));
+            break;
+
+        case 'create_room':
+            // Client wants to create a new whiteboard.
+            const roomId = uuidv4();
+            const newWhiteboard = {
+                id: roomId,
+                name: payload.name,
+                size: payload.size, // e.g., { width: 1000, height: 1000 }
+                creator: clients.get(ws.id).username,
+                createdAt: new Date().toISOString(),
+                clients: new Set(),
+                strokes: [],
+                userCursors: new Map() // { userId -> { x, y, username, color } }
+            };
+            whiteboards.set(roomId, newWhiteboard);
+            console.log(`[Server] Room created: ${payload.name} (${roomId})`);
+            // Notify all clients (even those in the lobby) about the new room.
+            broadcast({
+                type: 'room_list_update',
+                payload: { whiteboards: getWhiteboardList() }
+            });
+            break;
+
+        case 'join_room':
+            // Client wants to join an existing whiteboard.
+            leaveCurrentRoom(ws); // Ensure user leaves any previous room.
+
+            const roomToJoin = whiteboards.get(payload.roomId);
+            const clientData = clients.get(ws.id);
+            if (roomToJoin && clientData) {
+                roomToJoin.clients.add(ws.id);
+                clientData.currentRoomId = payload.roomId;
+                console.log(`[Server] Client ${ws.id} (${clientData.username}) joined room ${payload.roomId}`);
+
+                // Send the complete room state to the joining client.
+                ws.send(JSON.stringify({
+                    type: 'joined_room',
+                    payload: {
+                        roomId: roomToJoin.id,
+                        name: roomToJoin.name,
+                        size: roomToJoin.size,
+                        strokes: roomToJoin.strokes,
+                        users: getUserListForRoom(roomToJoin)
+                    }
+                }));
+
+                // Notify other clients in the room about the new user.
+                broadcastToRoom(payload.roomId, {
+                    type: 'user_joined',
+                    payload: { user: { id: ws.id, username: clientData.username } }
+                }, ws.id);
+            }
+            break;
+
+        case 'draw_stroke':
+             // Client sends a new drawing stroke.
+            const clientInRoom = clients.get(ws.id);
+            if (clientInRoom && clientInRoom.currentRoomId) {
+                const room = whiteboards.get(clientInRoom.currentRoomId);
+                if (room) {
+                    const stroke = { ...payload, id: uuidv4(), userId: ws.id };
+                    room.strokes.push(stroke);
+                    // Broadcast the new stroke to everyone else in the same room.
+                    broadcastToRoom(clientInRoom.currentRoomId, {
+                        type: 'new_stroke',
+                        payload: stroke
+                    }, ws.id); // Exclude the sender.
+                }
+            }
+            break;
+        
+        case 'delete_stroke':
+            // Client wants to delete a stroke they created.
+            const clientDeleting = clients.get(ws.id);
+            if(clientDeleting && clientDeleting.currentRoomId) {
+                const room = whiteboards.get(clientDeleting.currentRoomId);
+                if(room) {
+                    const strokeToDelete = room.strokes.find(s => s.id === payload.strokeId);
+                    // IMPORTANT: Security check. Only the user who created the stroke can delete it.
+                    if (strokeToDelete && strokeToDelete.userId === ws.id) {
+                        room.strokes = room.strokes.filter(s => s.id !== payload.strokeId);
+                         // Notify all clients in the room to remove the stroke.
+                        broadcastToRoom(clientDeleting.currentRoomId, {
+                            type: 'stroke_deleted',
+                            payload: { strokeId: payload.strokeId }
+                        });
+                    }
+                }
+            }
+            break;
+
+        case 'cursor_move':
+            // Client sends their cursor position.
+            const clientMoving = clients.get(ws.id);
+            if (clientMoving && clientMoving.currentRoomId) {
+                // This is a high-frequency event. We broadcast it directly.
+                // We don't store it in the main state to avoid clutter,
+                // but we could if we wanted to show cursors to newly joined users immediately.
+                broadcastToRoom(clientMoving.currentRoomId, {
+                    type: 'cursor_update',
+                    payload: {
+                        userId: ws.id,
+                        username: clientMoving.username,
+                        x: payload.x,
+                        y: payload.y,
+                        color: payload.color
+                    }
+                }, ws.id); // Exclude sender
+            }
+            break;
+    }
+}
+
+// -- Helper Functions --
+
+function handleDisconnect(ws) {
+    console.log(`[Server] Client disconnected: ${ws.id}`);
+    leaveCurrentRoom(ws);
+    clients.delete(ws.id);
+}
+
+function leaveCurrentRoom(ws) {
+    const clientData = clients.get(ws.id);
+    if (!clientData || !clientData.currentRoomId) return;
+
+    const room = whiteboards.get(clientData.currentRoomId);
+    if (room) {
+        console.log(`[Server] Client ${ws.id} leaving room ${clientData.currentRoomId}`);
+        room.clients.delete(ws.id);
+        // Notify others in the room that this user has left.
+        broadcastToRoom(clientData.currentRoomId, {
+            type: 'user_left',
+            payload: { userId: ws.id, username: clientData.username }
+        }, ws.id);
+    }
+    clientData.currentRoomId = null;
+}
+
+// Broadcast a message to all connected clients.
+function broadcast(message) {
+    const stringifiedMessage = JSON.stringify(message);
+    for (const clientData of clients.values()) {
+        clientData.ws.send(stringifiedMessage);
+    }
+}
+
+// Broadcast a message to all clients in a specific room.
+function broadcastToRoom(roomId, message, excludeClientId = null) {
+    const room = whiteboards.get(roomId);
+    if (!room) return;
+
+    const stringifiedMessage = JSON.stringify(message);
+    for (const clientId of room.clients) {
+        if (clientId !== excludeClientId) {
+            const clientData = clients.get(clientId);
+            if (clientData) {
+                clientData.ws.send(stringifiedMessage);
+            }
+        }
+    }
+}
+
+// Get a simplified list of whiteboards for the lobby view.
+function getWhiteboardList() {
+    return Array.from(whiteboards.values()).map(room => ({
+        id: room.id,
+        name: room.name,
+        creator: room.creator,
+        createdAt: room.createdAt,
+        userCount: room.clients.size
+    }));
+}
+
+// Get a list of users currently in a room.
+function getUserListForRoom(room) {
+    const userList = [];
+    for (const clientId of room.clients) {
+        const clientData = clients.get(clientId);
+        if (clientData) {
+            userList.push({ id: clientData.ws.id, username: clientData.username });
+        }
+    }
+    return userList;
+}
