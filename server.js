@@ -13,9 +13,11 @@ const whiteboards = new Map();
 const wss = new WebSocketServer({ port: PORT });
 console.log(`[Server] WebSocket server V2 started on port ${PORT}`);
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
     ws.id = uuidv4(); 
-    console.log(`[Server] Incoming connection with temporary ID: ${ws.id}`);
+    // Optional: Detect mobile connections for logging
+    const isMobile = req.headers['user-agent']?.includes('Mobile');
+    console.log(`[Server] Incoming connection with temporary ID: ${ws.id} (Mobile: ${isMobile})`);
 
     ws.on('message', (rawMessage) => {
         try {
@@ -35,6 +37,7 @@ wss.on('connection', (ws) => {
             }
         }
         if (userIdToDisconnect) {
+            console.log(`[Server] Disconnection detected for user ${userIdToDisconnect} (possibly mobile network change)`);
             handleDisconnect(userIdToDisconnect);
         } else {
              console.log(`[Server] Unauthenticated connection ${ws.id} closed.`);
